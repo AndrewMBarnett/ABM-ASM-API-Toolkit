@@ -54,7 +54,7 @@ brew install jq curl
 1. Clone this repository:
 
 ```bash
-git clone https://github.com/<username>/apple-device-export.git
+git clone https://github.com/andrewmbarnett/apple-device-export.git
 cd apple-device-export
 ```
 
