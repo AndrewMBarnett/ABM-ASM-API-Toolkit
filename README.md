@@ -37,7 +37,7 @@ This script connects to Apple’s device management APIs, fetches device informa
 ## Requirements
 
 * macOS or Linux environment
-* `bash` or `zsh` shell
+* JSON web token (JWT) * Bart has a great write up on setting this up: https://bartreardon.github.io/2025/06/11/using-the-new-api-for-apple-business-school-manager.html *
 * [jq](https://stedolan.github.io/jq/) (JSON parser)
 * `curl`
 
