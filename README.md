@@ -54,8 +54,8 @@ brew install jq curl
 1. Clone this repository:
 
 ```bash
-git clone https://github.com/andrewmbarnett/apple-device-export.git
-cd apple-device-export
+git clone https://github.com/andrewmbarnett/ABM-ASM-API-Toolkit.git
+cd ABM-ASM-API-Toolkit
 ```
 
 2. Make the script executable:
