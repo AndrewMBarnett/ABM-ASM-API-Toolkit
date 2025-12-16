@@ -153,18 +153,33 @@ prompt_for_variables() {
     else
         echo "Using JWT from configuration"
     fi
+
     # Prompt for Output Directory if not set
     if [[ -z "$OUTPUT_DIR" ]]; then
         echo ""
-        echo -n "Enter output directory (press Enter for current directory): "
-        read OUTPUT_DIR
-        if [[ -z "$OUTPUT_DIR" ]]; then
-            OUTPUT_DIR="."
+        echo -n "Do you need to set an output directory? (y/n, Enter for no): "
+        read need_output
+        
+        if [[ "$need_output" =~ ^[Yy]$ ]]; then
+            echo -n "Enter output directory (press Enter for current directory): "
+            read OUTPUT_DIR
+            if [[ -z "$OUTPUT_DIR" ]]; then
+                OUTPUT_DIR="."
+            fi
+            # Expand ~ to home directory
+            OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
+            echo "Output directory: $OUTPUT_DIR"
+        else
+            # Will be set later if needed
+            OUTPUT_DIR=""
+            echo "Output directory: Not set (will prompt if needed)"
         fi
+    else
+        # Expand ~ to home directory if already set
+        OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
+        echo "Output directory: $OUTPUT_DIR"
     fi
-    # Expand ~ to home directory
-    OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
-    echo "Output directory: $OUTPUT_DIR"
+
     echo ""
     echo "Configuration complete!"
     echo "======================="
@@ -261,111 +276,226 @@ fetch_mdm_server_devices() {
     echo "$body"
 }
 
-# Get full device details from device IDs
-get_device_details_from_ids() {
+# Fetch assigned MDM server for a device
+fetch_device_assigned_server() {
     local access_token="$1"
-    local device_ids_json="$2"
-
-    # Ensure input is valid JSON array
-    if ! echo "$device_ids_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        echo "[]" 
-        return
+    local device_id="$2"
+    
+    local url="${API_BASE_URL}/orgDevices/${device_id}/relationships/assignedServer"
+    
+    local response=$(curl -s -X GET "$url" \
+        -H "Authorization: Bearer $access_token" \
+        -w "\n%{http_code}")
+    
+    local http_code=$(echo "$response" | tail -n1)
+    local body=$(echo "$response" | sed '$d')
+    
+    if [[ "$http_code" != "200" ]]; then
+        # Return empty if not assigned or error
+        echo '{"data": null}'
+        return 1
     fi
-
-    local all_devices="[]"
-    local device_count
-    device_count=$(echo "$device_ids_json" | jq 'length')
-
-    if [[ "$device_count" -eq 0 ]]; then
-        echo "[]"
-        return
-    fi
-
-    local idx=0
-
-    echo ""
-    echo "Fetching device details ($device_count devices)..."
-    echo ""
-
-    # IMPORTANT: process substitution (NO subshell variable loss)
-    while read -r device_ref; do
-        ((idx++))
-
-        local device_id
-        device_id=$(echo "$device_ref" | jq -r '.id')
-
-        echo "  [$idx/$device_count] Fetching device: $device_id" >&2
-
-        local device
-        device=$(fetch_device_by_id "$access_token" "$device_id") || continue
-
-        # Validate response JSON
-        if ! echo "$device" | jq -e '.data' >/dev/null 2>&1; then
-            echo "    Warning: Invalid JSON for device $device_id — skipping" >&2
-            continue
-        fi
-
-        local enhanced_device
-        enhanced_device=$(echo "$device" | jq -c '.data')
-
-        # Append safely
-        all_devices=$(echo "$all_devices" | jq --argjson new "$enhanced_device" '. + [$new]')
-
-        # Throttle (ASM-safe)
-        sleep 0.25
-
-    done < <(echo "$device_ids_json" | jq -c '.[]')
-
-    echo ""
-    echo "Successfully fetched $(echo "$all_devices" | jq 'length') device(s)."
-    echo ""
-
-    # Always return valid JSON
-    echo "$all_devices"
+    
+    echo "$body"
 }
 
 # Fetch single device by ID with full details
 fetch_device_by_id() {
     local access_token="$1"
     local device_id="$2"
-
+    
     local url="${API_BASE_URL}/orgDevices/${device_id}"
     local max_retries=5
     local attempt=1
-
+    
     while [[ $attempt -le $max_retries ]]; do
         local response
         response=$(curl -s -X GET "$url" \
             -H "Authorization: Bearer $access_token" \
             -w "\n%{http_code}")
-
+        
         local http_code
         http_code=$(echo "$response" | tail -n1)
         local body
         body=$(echo "$response" | sed '$d')
-
+        
         if [[ "$http_code" == "200" ]]; then
-            echo "$body"
-            return 0
+            # Validate JSON before returning
+            if echo "$body" | jq -e '.data' >/dev/null 2>&1; then
+                echo "$body"
+                return 0
+            else
+                echo "    Warning: Invalid JSON response for $device_id" >&2
+                return 1
+            fi
         fi
-
+        
         if [[ "$http_code" == "429" ]]; then
-            local wait_time=$((attempt * 2))
+            local wait_time=$((attempt * 3))  # Increase wait time
             echo "    Rate limited (429). Retry $attempt/$max_retries in ${wait_time}s..." >&2
             sleep "$wait_time"
             ((attempt++))
             continue
         fi
-
-        echo "Error: Failed to fetch device $device_id (HTTP $http_code)" >&2
-        echo "Response: $body" >&2
+        
+        # Other HTTP errors
+        echo "    Error: HTTP $http_code for device $device_id" >&2
         return 1
     done
-
-    echo "Error: Giving up on device $device_id after $max_retries retries." >&2
+    
+    echo "    Error: Giving up on device $device_id after $max_retries retries." >&2
     return 1
 }
 
+# Get full device details from device IDs
+get_device_details_from_ids() {
+    local access_token="$1"
+    local device_ids_json="$2"
+    local mdm_servers_json="$3"
+    
+    # Ensure input is valid JSON array
+    if ! echo "$device_ids_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        echo "[]"
+        return
+    fi
+    
+    local device_count
+    device_count=$(echo "$device_ids_json" | jq 'length')
+    
+    if [[ "$device_count" -eq 0 ]]; then
+        echo "[]"
+        return
+    fi
+    
+    # Build MDM server lookup table (ID -> Name)
+    local mdm_lookup="{}"
+    if [[ -n "$mdm_servers_json" ]]; then
+        mdm_lookup=$(echo "$mdm_servers_json" | jq -r '.data | map({(.id): .attributes.serverName}) | add // {}')
+    fi
+    
+    echo "" >&2
+    echo "Fetching device details ($device_count devices)..." >&2
+    echo "" >&2
+    
+    # Use temporary file to accumulate results
+    local temp_file=$(mktemp)
+    local idx=0
+    
+    # Create array of device IDs
+    local device_id_array=()
+    while IFS= read -r device_id; do
+        device_id_array+=("$device_id")
+    done < <(echo "$device_ids_json" | jq -r '.[].id')
+    
+    # Process each device ID
+    for device_id in "${device_id_array[@]}"; do
+        ((idx++))
+        
+        # Show progress (every 10 devices, first, and last)
+        if [[ $((idx % 10)) -eq 1 ]] || [[ $idx -eq $device_count ]]; then
+            echo "  [$idx/$device_count] Fetching device: $device_id" >&2
+        fi
+        
+        # Fetch device (redirect all output to proper channels)
+        local device
+        device=$(fetch_device_by_id "$access_token" "$device_id" 2>&2)
+        local fetch_result=$?
+        
+        # Check if fetch was successful
+        if [[ $fetch_result -ne 0 ]] || [[ -z "$device" ]]; then
+            continue
+        fi
+        
+        # Validate it's valid JSON with a .data field
+        if ! echo "$device" | jq -e '.data' >/dev/null 2>&1; then
+            echo "    Warning: Invalid JSON for device $device_id — skipping" >&2
+            continue
+        fi
+        
+        # Extract device data
+        local device_data
+        device_data=$(echo "$device" | jq -c '.data' 2>/dev/null)
+        
+        # Fetch assigned MDM server
+        local assigned_server
+        assigned_server=$(fetch_device_assigned_server "$access_token" "$device_id" 2>&2)
+        local server_id
+        server_id=$(echo "$assigned_server" | jq -r '.data.id // null' 2>/dev/null)
+        
+        if [[ "$server_id" != "null" ]] && [[ -n "$server_id" ]]; then
+            # Look up server name from MDM servers list
+            local server_name
+            server_name=$(echo "$mdm_lookup" | jq -r --arg id "$server_id" '.[$id] // $id')
+            device_data=$(echo "$device_data" | jq --arg id "$server_id" --arg name "$server_name" '. + {assignedMdmServerId: $id, assignedMdmServerName: $name}' 2>/dev/null)
+        else
+            device_data=$(echo "$device_data" | jq '. + {assignedMdmServerId: null, assignedMdmServerName: "Unassigned"}' 2>/dev/null)
+        fi
+        
+        # Validate and write
+        if [[ -n "$device_data" ]] && [[ "$device_data" != "null" ]]; then
+            if echo "$device_data" | jq -e '.' >/dev/null 2>&1; then
+                echo "$device_data" >> "$temp_file"
+            fi
+        fi
+        
+        # Throttle to avoid rate limiting
+        sleep 2.0
+    done
+    
+    echo "" >&2
+    echo "Building final JSON array..." >&2
+    
+    # Build JSON array from temp file
+    local all_devices="[]"
+    
+    if [[ -f "$temp_file" ]] && [[ -s "$temp_file" ]]; then
+        # Try jq -s (combine into array)
+        all_devices=$(jq -s '.' "$temp_file" 2>/dev/null)
+        
+        # If that fails, build array manually
+        if [[ $? -ne 0 ]] || [[ -z "$all_devices" ]] || [[ "$all_devices" == "null" ]]; then
+            echo "  jq -s failed, building array manually..." >&2
+            
+            # Start array
+            all_devices="["
+            local first=true
+            
+            while IFS= read -r line; do
+                # Validate line is valid JSON
+                if echo "$line" | jq -e '.' >/dev/null 2>&1; then
+                    if [[ "$first" == true ]]; then
+                        all_devices="${all_devices}${line}"
+                        first=false
+                    else
+                        all_devices="${all_devices},${line}"
+                    fi
+                fi
+            done < "$temp_file"
+            
+            # Close array
+            all_devices="${all_devices}]"
+        fi
+    fi
+    
+    # Clean up
+    rm -f "$temp_file"
+    
+    # Final validation and count
+    local final_count=0
+    if echo "$all_devices" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        final_count=$(echo "$all_devices" | jq 'length' 2>/dev/null || echo "0")
+    else
+        all_devices="[]"
+    fi
+    
+    echo "" >&2
+    echo "Fetch complete:" >&2
+    echo "  Successfully fetched: $final_count devices" >&2
+    echo "" >&2
+    
+    # Output ONLY the JSON to stdout (no extra text!)
+    printf "%s" "$all_devices"
+}
 
 # Get devices for specific MDM servers
 get_devices_for_mdm_servers() {
@@ -568,16 +698,49 @@ export_devices_with_filter() {
     echo "Found $device_count unique device(s). Fetching details..."
 
     # ---- Fetch full device records ----
+    echo ""
+    echo "Calling get_device_details_from_ids..." >&2
+
     local DEVICES
-    DEVICES=$(get_device_details_from_ids "$access_token" "$device_ids")
+    DEVICES=$(get_device_details_from_ids "$access_token" "$device_ids" "$mdm_servers")
+
+    echo "Return value received. Length: ${#DEVICES}" >&2
+    echo "First 100 chars: ${DEVICES:0:100}" >&2
+
+    # Validate that DEVICES is valid JSON array
+    if ! echo "$DEVICES" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        echo ""
+        echo "========================================="
+        echo "Error: Device fetch returned invalid data"
+        echo "========================================="
+        echo ""
+        echo "Raw output (first 500 chars):"
+        echo "${DEVICES:0:500}"
+        echo ""
+        echo "This could be due to:"
+        echo "  - Rate limiting from Apple's API"
+        echo "  - Network connectivity issues"
+        echo "  - API errors"
+        echo ""
+        echo "Please try again in a few minutes."
+        return
+    fi
 
     local final_device_count
     final_device_count=$(echo "$DEVICES" | jq 'length')
 
     if [[ "$final_device_count" -eq 0 ]]; then
-        echo "Device detail fetch returned no data."
+        echo ""
+        echo "========================================="
+        echo "No devices were successfully retrieved"
+        echo "========================================="
         return
     fi
+
+    echo ""
+    echo "========================================="
+    echo "Successfully retrieved $final_device_count of $device_count devices"
+    echo "========================================="
 
     # ---- Output files ----
     local timestamp
@@ -591,7 +754,7 @@ export_devices_with_filter() {
     echo "Devices saved to: $json_file"
 
     # ---- CSV export ----
-    echo "ID,Serial Number,Model,Product Family,Product Type,Status,Color,Capacity,Added to Org" > "$csv_file"
+    echo "ID,Serial Number,Model,Product Family,Product Type,Status,Color,Capacity,Added to Org,Assigned MDM Server" > "$csv_file"
     echo "$DEVICES" | jq -r '.[] | [
         .id // "",
         .attributes.serialNumber // "",
@@ -601,7 +764,8 @@ export_devices_with_filter() {
         .attributes.status // "",
         .attributes.color // "",
         .attributes.deviceCapacity // "",
-        .attributes.addedToOrgDateTime // ""
+        .attributes.addedToOrgDateTime // "",
+        .assignedMdmServerName // "Unassigned"
     ] | @csv' >> "$csv_file"
 
     echo "CSV export saved to: $csv_file"
@@ -613,19 +777,32 @@ export_devices_with_filter() {
     echo "========================================="
     echo "Total devices exported: $final_device_count"
 
-    echo ""
-    echo "Devices by Model:"
-    echo "$DEVICES" | jq -r '
-        group_by(.attributes.deviceModel) |
-        .[] | "\(.length)x \(.[0].attributes.deviceModel)"
-    ' | sort -rn
-
-    echo ""
-    echo "Devices by Status:"
-    echo "$DEVICES" | jq -r '
-        group_by(.attributes.status) |
-        .[] | "\(.length)x \(.[0].attributes.status)"
-    ' | sort -rn
+    # Only show groupings if we have devices
+    if [[ "$final_device_count" -gt 0 ]]; then
+        echo ""
+        echo "Devices by Model:"
+        if echo "$DEVICES" | jq -e '.[0].attributes.deviceModel' >/dev/null 2>&1; then
+            echo "$DEVICES" | jq -r 'group_by(.attributes.deviceModel) | .[] | "\(.[0].attributes.deviceModel): \(length)"' | sort -t: -k2 -rn | column -t -s:
+        else
+            echo "  (Model information not available)"
+        fi
+        
+        echo ""
+        echo "Devices by Status:"
+        if echo "$DEVICES" | jq -e '.[0].attributes.status' >/dev/null 2>&1; then
+            echo "$DEVICES" | jq -r 'group_by(.attributes.status) | .[] | "\(.[0].attributes.status): \(length)"' | sort -t: -k2 -rn | column -t -s:
+        else
+            echo "  (Status information not available)"
+        fi
+        
+        echo ""
+        echo "Devices by Product Family:"
+        if echo "$DEVICES" | jq -e '.[0].attributes.productFamily' >/dev/null 2>&1; then
+            echo "$DEVICES" | jq -r 'group_by(.attributes.productFamily) | .[] | "\(.[0].attributes.productFamily): \(length)"' | sort -t: -k2 -rn | column -t -s:
+        else
+            echo "  (Product family information not available)"
+        fi
+    fi
 
     echo ""
     echo -n "View detailed device list? (y/n): "
@@ -1115,8 +1292,10 @@ main() {
     echo "Apple School Manager API - Device Management Tool"
     echo "================================================="
     echo ""
+    
     # Check dependencies
     check_dependencies
+    
     # Allow command line arguments to override
     if [[ -n "$1" ]]; then
         CLIENT_ASSERTION="$1"
@@ -1127,19 +1306,23 @@ main() {
     if [[ -n "$3" ]]; then
         OUTPUT_DIR="$3"
     fi
+    
     # Configure Apple Manager settings
     configure_apple_manager
+    
     # Prompt for any missing variables
     prompt_for_variables
-    # Create output directory
-    create_output_directory "$OUTPUT_DIR"
-    # Get access token
+    
+    # Get access token (DON'T create output directory here)
     ACCESS_TOKEN=$(get_access_token "$CLIENT_ASSERTION" "$CLIENT_ID" "$SCOPE")
+    
     if [[ -z "$ACCESS_TOKEN" ]]; then
         echo "Error: Failed to get access token"
         exit 1
     fi
+    
     echo ""
+    
     # Show main menu
     echo "Main Menu:"
     echo "  1. Export devices from MDM server(s)"
@@ -1149,6 +1332,7 @@ main() {
     echo ""
     echo -n "Choose option (1-4): "
     read main_choice
+    
     if [[ "$main_choice" == "4" ]]; then
         echo "Goodbye!"
         exit 0
@@ -1165,11 +1349,52 @@ main() {
     fi
     
     if [[ "$main_choice" == "1" ]]; then
+        # Ensure output directory is set for export
+        if [[ -z "$OUTPUT_DIR" ]]; then
+            echo ""
+            echo -n "Enter output directory (press Enter for current directory): "
+            read OUTPUT_DIR
+            if [[ -z "$OUTPUT_DIR" ]]; then
+                OUTPUT_DIR="."
+            fi
+            OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
+            echo "Output directory: $OUTPUT_DIR"
+            echo ""
+        fi
+        
+        # NOW create the directory
+        create_output_directory "$OUTPUT_DIR"
+        
         export_devices_with_filter "$ACCESS_TOKEN" "$MDM_SERVERS" "$OUTPUT_DIR"
+        
     elif [[ "$main_choice" == "2" ]]; then
+        # For assignments, set a default if not set (for activity reports)
+        if [[ -z "$OUTPUT_DIR" ]]; then
+            OUTPUT_DIR="$HOME/Downloads"
+            echo ""
+            echo "Using default directory for activity reports: $OUTPUT_DIR"
+            echo ""
+        fi
+        
+        # NOW create the directory
+        create_output_directory "$OUTPUT_DIR"
+        
         interactive_mdm_assignment "$ACCESS_TOKEN" "$MDM_SERVERS" "$OUTPUT_DIR"
+        
     elif [[ "$main_choice" == "3" ]]; then
+        # For checking activity status, set default if not set
+        if [[ -z "$OUTPUT_DIR" ]]; then
+            OUTPUT_DIR="$HOME/Downloads"
+            echo ""
+            echo "Using default directory for downloads: $OUTPUT_DIR"
+            echo ""
+        fi
+        
+        # NOW create the directory
+        create_output_directory "$OUTPUT_DIR"
+        
         check_activity_by_id "$ACCESS_TOKEN" "$OUTPUT_DIR"
+        
     else
         echo "Invalid option."
         exit 1
