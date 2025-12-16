@@ -61,7 +61,7 @@ cd apple-device-export
 2. Make the script executable:
 
 ```bash
-chmod +x export_devices.sh
+chmod +x ABM_ASM_API.sh
 ```
 
 3. Prepare your Apple API credentials:
@@ -76,7 +76,7 @@ chmod +x export_devices.sh
 Run the script:
 
 ```bash
-./export_devices.sh
+./ABM_ASM_API.sh
 ```
 
 The script will prompt for any missing configuration, including:
