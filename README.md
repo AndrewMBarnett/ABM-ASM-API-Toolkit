@@ -1,4 +1,4 @@
-# Apple School/Business Manager Device Export Tool
+# Apple School/Business Manager Toolkit
 
 A command-line tool to fetch and export device information from **Apple School Manager (ASM)** or **Apple Business Manager (ABM)** using OAuth 2.0 authentication. Supports exporting devices in **JSON** and **CSV** formats.
 
