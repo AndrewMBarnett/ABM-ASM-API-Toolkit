@@ -1,8 +1,13 @@
 #!/bin/zsh --no-rcs
-  
+set +x
+
 # ABM-ASM API Tookit - Device Management Tool
 # A script to manage devices in Apple School Manager and Apple Business Manager via the ASM/ABM API
   
+SCRIPT_NAME="ABM-ASM API ToolKit"
+SCRIPT_VERSION="1.4.0"
+SCRIPT_LOG="/var/log/ABM-ASM_API_ToolKit.log"
+
 # ============================================================================
 # CONFIGURATION - UPDATE THESE VALUES (or leave empty to be prompted)
 # ============================================================================
@@ -26,7 +31,42 @@ APPLE_MANAGER_TYPE=""
 # ============================================================================
 # FUNCTIONS
 # ============================================================================
-  
+
+# Create log file if it doesn't exist
+if [[ ! -f "${SCRIPT_LOG}" ]]; then
+    touch "${SCRIPT_LOG}"
+    chmod 644 "${SCRIPT_LOG}"
+fi
+
+# Logging functions
+function update_script_log() {
+    echo "${SCRIPT_NAME} (${SCRIPT_VERSION}): $(date +%Y-%m-%d\ %H:%M:%S) - ${1}" | tee -a "${SCRIPT_LOG}"
+}
+# INFO - General information (shown to user and logged)
+log_info() {
+    update_script_log "[INFO]            ${1}"
+}
+
+# WARN - Warnings (shown to user and logged)
+log_warn() {
+    update_script_log "[WARN]            ${1}"
+}
+
+# ERROR - Errors (shown to user and logged)
+log_error() {
+    update_script_log "[ERROR]           ${1}"
+}
+
+# DEBUG - Debug info (only logged, not shown to user)
+log_debug() {
+    update_script_log "[DEBUG]           ${1}"
+}
+
+# SUCCESS - Success messages (shown to user and logged)
+log_success() {
+    update_script_log "[SUCCESS]         ${1}"
+}
+
 # Check dependencies
 check_dependencies() {
     local missing_deps=()
@@ -299,6 +339,29 @@ fetch_device_assigned_server() {
     echo "$body"
 }
 
+# Fetch AppleCare coverage for a device
+fetch_applecare_coverage() {
+    local access_token="$1"
+    local device_id="$2"
+    
+    local url="${API_BASE_URL}/orgDevices/${device_id}/appleCareCoverage"
+    
+    local response=$(curl -s -X GET "$url" \
+        -H "Authorization: Bearer $access_token" \
+        -w "\n%{http_code}")
+    
+    local http_code=$(echo "$response" | tail -n1)
+    local body=$(echo "$response" | sed '$d')
+    
+    if [[ "$http_code" != "200" ]]; then
+        # Return empty array if no coverage found or error
+        echo '{"data": []}'
+        return 1
+    fi
+    
+    echo "$body"
+}
+
 # Fetch single device by ID with full details
 fetch_device_by_id() {
     local access_token="$1"
@@ -325,176 +388,157 @@ fetch_device_by_id() {
                 echo "$body"
                 return 0
             else
-                echo "    Warning: Invalid JSON response for $device_id" >&2
+                log_warn "Invalid JSON response for $device_id"
                 return 1
             fi
         fi
         
         if [[ "$http_code" == "429" ]]; then
-            local wait_time=$((attempt * 3))  # Increase wait time
-            echo "    Rate limited (429). Retry $attempt/$max_retries in ${wait_time}s..." >&2
+            local wait_time=$((attempt * 3))
+            log_debug "Rate limited (429) for $device_id. Retry $attempt/$max_retries in ${wait_time}s"
             sleep "$wait_time"
             ((attempt++))
             continue
         fi
         
         # Other HTTP errors
-        echo "    Error: HTTP $http_code for device $device_id" >&2
+        log_debug "HTTP $http_code for device $device_id"
         return 1
     done
     
-    echo "    Error: Giving up on device $device_id after $max_retries retries." >&2
+    log_warn "Giving up on device $device_id after $max_retries retries"
     return 1
 }
 
 # Get full device details from device IDs
 get_device_details_from_ids() {
-    local access_token="$1"
-    local device_ids_json="$2"
-    local mdm_servers_json="$3"
-    
-    # Ensure input is valid JSON array
-    if ! echo "$device_ids_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        echo "[]"
-        return
-    fi
-    
-    local device_count
-    device_count=$(echo "$device_ids_json" | jq 'length')
-    
-    if [[ "$device_count" -eq 0 ]]; then
-        echo "[]"
-        return
-    fi
-    
-    # Build MDM server lookup table (ID -> Name)
-    local mdm_lookup="{}"
-    if [[ -n "$mdm_servers_json" ]]; then
-        mdm_lookup=$(echo "$mdm_servers_json" | jq -r '.data | map({(.id): .attributes.serverName}) | add // {}')
-    fi
-    
-    echo "" >&2
-    echo "Fetching device details ($device_count devices)..." >&2
-    echo "" >&2
-    
-    # Use temporary file to accumulate results
-    local temp_file=$(mktemp)
-    local idx=0
-    
-    # Create array of device IDs
-    local device_id_array=()
-    while IFS= read -r device_id; do
-        device_id_array+=("$device_id")
-    done < <(echo "$device_ids_json" | jq -r '.[].id')
-    
-    # Process each device ID
-    for device_id in "${device_id_array[@]}"; do
-        ((idx++))
+    {
+        # Explicitly disable any tracing in a subshell
+        set +x
+        setopt LOCAL_OPTIONS 2>/dev/null
+        unsetopt XTRACE 2>/dev/null
         
-        # Show progress (every 10 devices, first, and last)
-        if [[ $((idx % 10)) -eq 1 ]] || [[ $idx -eq $device_count ]]; then
-            echo "  [$idx/$device_count] Fetching device: $device_id" >&2
+        local access_token="$1"
+        local device_ids_json="$2"
+        local mdm_servers_json="$3"
+        local fetch_applecare="$4"
+        
+        # Ensure input is valid JSON array
+        if ! echo "$device_ids_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            printf '[]'
+            return
         fi
         
-        # Fetch device (redirect all output to proper channels)
-        local device
-        device=$(fetch_device_by_id "$access_token" "$device_id" 2>&2)
-        local fetch_result=$?
+        local device_count
+        device_count=$(echo "$device_ids_json" | jq 'length')
         
-        # Check if fetch was successful
-        if [[ $fetch_result -ne 0 ]] || [[ -z "$device" ]]; then
-            continue
+        if [[ "$device_count" -eq 0 ]]; then
+            printf '[]'
+            return
         fi
         
-        # Validate it's valid JSON with a .data field
-        if ! echo "$device" | jq -e '.data' >/dev/null 2>&1; then
-            echo "    Warning: Invalid JSON for device $device_id — skipping" >&2
-            continue
+        # Build MDM server lookup table (ID -> Name)
+        local mdm_lookup="{}"
+        if [[ -n "$mdm_servers_json" ]]; then
+            mdm_lookup=$(echo "$mdm_servers_json" | jq -r '.data | map({(.id): .attributes.serverName}) | add // {}' 2>/dev/null)
         fi
         
-        # Extract device data
-        local device_data
-        device_data=$(echo "$device" | jq -c '.data' 2>/dev/null)
+        # Use temporary file to accumulate results
+        local temp_file
+        temp_file=$(mktemp)
         
-        # Fetch assigned MDM server
-        local assigned_server
-        assigned_server=$(fetch_device_assigned_server "$access_token" "$device_id" 2>&2)
-        local server_id
-        server_id=$(echo "$assigned_server" | jq -r '.data.id // null' 2>/dev/null)
+        local idx=0
+        local success_count=0
+        local error_count=0
         
-        if [[ "$server_id" != "null" ]] && [[ -n "$server_id" ]]; then
-            # Look up server name from MDM servers list
-            local server_name
-            server_name=$(echo "$mdm_lookup" | jq -r --arg id "$server_id" '.[$id] // $id')
-            device_data=$(echo "$device_data" | jq --arg id "$server_id" --arg name "$server_name" '. + {assignedMdmServerId: $id, assignedMdmServerName: $name}' 2>/dev/null)
-        else
-            device_data=$(echo "$device_data" | jq '. + {assignedMdmServerId: null, assignedMdmServerName: "Unassigned"}' 2>/dev/null)
-        fi
+        # Create array of device IDs
+        local -a device_id_array
+        while IFS= read -r device_id; do
+            device_id_array+=("$device_id")
+        done < <(echo "$device_ids_json" | jq -r '.[].id' 2>/dev/null)
         
-        # Validate and write
-        if [[ -n "$device_data" ]] && [[ "$device_data" != "null" ]]; then
-            if echo "$device_data" | jq -e '.' >/dev/null 2>&1; then
-                echo "$device_data" >> "$temp_file"
+        # Process each device ID
+        for device_id in "${device_id_array[@]}"; do
+            ((idx++))
+            
+            log_info "Processing device $idx of $device_count (ID: $device_id)" >> $SCRIPT_LOG
+            # # Show progress (every 10 devices)
+            # if [[ $((idx % 10)) -eq 1 ]] || [[ $idx -eq $device_count ]]; then
+            #     echo "Processing device $idx of $device_count" >> $SCRIPT_LOG
+            # fi
+            
+            # Fetch device
+            local device
+            device=$(fetch_device_by_id "$access_token" "$device_id" 2>/dev/null)
+            
+            [[ $? -ne 0 ]] || [[ -z "$device" ]] && { ((error_count++)); continue; }
+            
+            # Validate JSON
+            echo "$device" | jq -e '.data' >/dev/null 2>&1 || { ((error_count++)); continue; }
+            
+            # Extract device data
+            local device_data
+            device_data=$(echo "$device" | jq -c '.data' 2>/dev/null)
+            
+            [[ -z "$device_data" ]] || [[ "$device_data" == "null" ]] && { ((error_count++)); continue; }
+            
+            # Fetch assigned MDM server
+            local assigned_server
+            assigned_server=$(fetch_device_assigned_server "$access_token" "$device_id" 2>/dev/null)
+            
+            local server_id
+            server_id=$(echo "$assigned_server" | jq -r '.data.id // null' 2>/dev/null)
+            
+            if [[ "$server_id" != "null" ]] && [[ -n "$server_id" ]]; then
+                local server_name
+                server_name=$(echo "$mdm_lookup" | jq -r --arg id "$server_id" '.[$id] // $id' 2>/dev/null)
+                device_data=$(echo "$device_data" | jq --arg id "$server_id" --arg name "$server_name" '. + {assignedMdmServerId: $id, assignedMdmServerName: $name}' 2>/dev/null)
+            else
+                device_data=$(echo "$device_data" | jq '. + {assignedMdmServerId: null, assignedMdmServerName: "Unassigned"}' 2>/dev/null)
             fi
+
+            # Fetch AppleCare coverage if requested
+            if [[ "$fetch_applecare" == "true" ]]; then
+                local coverage
+                coverage=$(fetch_applecare_coverage "$access_token" "$device_id" 2>/dev/null)
+                local coverage_data
+                coverage_data=$(echo "$coverage" | jq -c '.data // []' 2>/dev/null)
+                
+                # Add AppleCare coverage to device object
+                device_data=$(echo "$device_data" | jq --argjson coverage "$coverage_data" '. + {appleCareCoverage: $coverage}' 2>/dev/null)
+            fi
+            
+            # Validate and write
+            if echo "$device_data" | jq -e 'type == "object"' >/dev/null 2>&1; then
+                printf '%s\n' "$device_data" >> "$temp_file"
+                ((success_count++))
+            else
+                ((error_count++))
+            fi
+            
+            sleep 1.0
+        done
+        
+        # Build JSON array from temp file
+        local all_devices
+        
+        if [[ -f "$temp_file" ]] && [[ -s "$temp_file" ]]; then
+            all_devices=$(jq -s '.' "$temp_file" 2>/dev/null)
+            
+            if [[ $? -ne 0 ]] || [[ -z "$all_devices" ]] || [[ "$all_devices" == "null" ]]; then
+                all_devices="[]"
+            fi
+        else
+            all_devices="[]"
         fi
         
-        # Throttle to avoid rate limiting
-        sleep 2.0
-    done
-    
-    echo "" >&2
-    echo "Building final JSON array..." >&2
-    
-    # Build JSON array from temp file
-    local all_devices="[]"
-    
-    if [[ -f "$temp_file" ]] && [[ -s "$temp_file" ]]; then
-        # Try jq -s (combine into array)
-        all_devices=$(jq -s '.' "$temp_file" 2>/dev/null)
+        # Clean up
+        rm -f "$temp_file"
         
-        # If that fails, build array manually
-        if [[ $? -ne 0 ]] || [[ -z "$all_devices" ]] || [[ "$all_devices" == "null" ]]; then
-            echo "  jq -s failed, building array manually..." >&2
-            
-            # Start array
-            all_devices="["
-            local first=true
-            
-            while IFS= read -r line; do
-                # Validate line is valid JSON
-                if echo "$line" | jq -e '.' >/dev/null 2>&1; then
-                    if [[ "$first" == true ]]; then
-                        all_devices="${all_devices}${line}"
-                        first=false
-                    else
-                        all_devices="${all_devices},${line}"
-                    fi
-                fi
-            done < "$temp_file"
-            
-            # Close array
-            all_devices="${all_devices}]"
-        fi
-    fi
-    
-    # Clean up
-    rm -f "$temp_file"
-    
-    # Final validation and count
-    local final_count=0
-    if echo "$all_devices" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        final_count=$(echo "$all_devices" | jq 'length' 2>/dev/null || echo "0")
-    else
-        all_devices="[]"
-    fi
-    
-    echo "" >&2
-    echo "Fetch complete:" >&2
-    echo "  Successfully fetched: $final_count devices" >&2
-    echo "" >&2
-    
-    # Output ONLY the JSON to stdout (no extra text!)
-    printf "%s" "$all_devices"
+        # Output only JSON
+        printf '%s' "$all_devices"
+        
+    } 2>&1 | grep -v '^[a-zA-Z_][a-zA-Z0-9_]*=' | grep -v '^\${'
 }
 
 # Get devices for specific MDM servers
@@ -633,142 +677,61 @@ select_mdm_servers() {
     fi
 }
 
-# Export devices with MDM filtering
-export_devices_with_filter() {
-    local access_token="$1"
-    local mdm_servers="$2"
-    local output_dir="$3"
+export_csv_devices() {
+    local DEVICES="$1"
+    local csv_file="$2"
+    local fetch_applecare="$3"
 
-    echo ""
-    echo "MDM Server Selection"
-    echo "===================="
+    log_info "Creating CSV export: $csv_file"
 
-    # ---- Get selection (ONLY call once) ----
-    local filter_result
-    filter_result=$(select_mdm_servers_interactive "$mdm_servers")
+    if [[ "$fetch_applecare" == "true" ]]; then
+        echo "ID,Serial Number,Model,Product Family,Product Type,Status,Color,Capacity,Added to Org,Assigned MDM Server,WiFi MAC,Org Release Date,AppleCare Descriptions,AppleCare Statuses,AppleCare Start Dates,AppleCare End Dates,AppleCare Payment Types" > "$csv_file"
 
-    # ---- Handle cancel / errors ----
-    if [[ "$filter_result" == "CANCEL" ]]; then
-        echo "Export canceled by user."
-        return
-    fi
-
-    if [[ "$filter_result" == ERROR:* ]]; then
-        echo "Selection error: ${filter_result#ERROR:}"
-        return
-    fi
-
-    # ---- Parse selected server IDs ----
-    local selected_server_ids=()
-    if [[ "$filter_result" =~ ^SELECTED: ]]; then
-        local server_ids="${filter_result#SELECTED:}"
-        IFS=' ' read -rA selected_server_ids <<< "$server_ids"
+        echo "$DEVICES" | jq -r '.[] |
+            .appleCareCoverage // [] as $coverage |
+            [
+                .id // "",
+                .attributes.serialNumber // "",
+                .attributes.deviceModel // "",
+                .attributes.productFamily // "",
+                .attributes.productType // "",
+                .attributes.status // "",
+                .attributes.color // "",
+                .attributes.deviceCapacity // "",
+                .attributes.addedToOrgDateTime // "",
+                .assignedMdmServerName // "Unassigned",
+                .attributes.wifiMacAddress // "",
+                .attributes.releasedFromOrgDateTime // "",
+                ($coverage | map(.attributes.description) | join(" | ")),
+                ($coverage | map(.attributes.status) | join(" | ")),
+                ($coverage | map(.attributes.startDateTime) | join(" | ")),
+                ($coverage | map(.attributes.endDateTime // "No end date") | join(" | ")),
+                ($coverage | map(.attributes.paymentType) | join(" | "))
+            ] | @csv' >> "$csv_file"
     else
-        echo "Unexpected selection result: [$filter_result]"
-        return
+        echo "ID,Serial Number,Model,Product Family,Product Type,Status,Color,Capacity,Added to Org,Assigned MDM Server,WiFi MAC,Org Release Date" > "$csv_file"
+
+        echo "$DEVICES" | jq -r '.[] | [
+            .id // "",
+            .attributes.serialNumber // "",
+            .attributes.deviceModel // "",
+            .attributes.productFamily // "",
+            .attributes.productType // "",
+            .attributes.status // "",
+            .attributes.color // "",
+            .attributes.deviceCapacity // "",
+            .attributes.addedToOrgDateTime // "",
+            .assignedMdmServerName // "Unassigned",
+            .attributes.wifiMacAddress // "",
+            .attributes.releasedFromOrgDateTime // ""
+        ] | @csv' >> "$csv_file"
     fi
 
-    if [[ "${#selected_server_ids[@]}" -eq 0 ]]; then
-        echo "No valid MDM servers selected. Nothing to export."
-        return
-    fi
+    echo "CSV saved to: $csv_file"
+}
 
-    echo ""
-    echo "Selected MDM server(s):"
-    for id in "${selected_server_ids[@]}"; do
-        local name
-        name=$(echo "$mdm_servers" | jq -r --arg id "$id" '.data[] | select(.id == $id) | .attributes.serverName')
-        echo "  - $id ($name)"
-    done
-
-    # ---- Fetch device IDs from selected MDM servers ----
-    echo ""
-    local device_ids
-    device_ids=$(get_devices_for_mdm_servers "$access_token" "${selected_server_ids[@]}")
-
-    local device_count
-    device_count=$(echo "$device_ids" | jq 'length')
-
-    if [[ "$device_count" -eq 0 ]]; then
-        echo "No devices found in the selected MDM server(s)."
-        return
-    fi
-
-    echo ""
-    echo "Found $device_count unique device(s). Fetching details..."
-
-    # ---- Fetch full device records ----
-    echo ""
-    echo "Calling get_device_details_from_ids..." >&2
-
-    local DEVICES
-    DEVICES=$(get_device_details_from_ids "$access_token" "$device_ids" "$mdm_servers")
-
-    echo "Return value received. Length: ${#DEVICES}" >&2
-    echo "First 100 chars: ${DEVICES:0:100}" >&2
-
-    # Validate that DEVICES is valid JSON array
-    if ! echo "$DEVICES" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        echo ""
-        echo "========================================="
-        echo "Error: Device fetch returned invalid data"
-        echo "========================================="
-        echo ""
-        echo "Raw output (first 500 chars):"
-        echo "${DEVICES:0:500}"
-        echo ""
-        echo "This could be due to:"
-        echo "  - Rate limiting from Apple's API"
-        echo "  - Network connectivity issues"
-        echo "  - API errors"
-        echo ""
-        echo "Please try again in a few minutes."
-        return
-    fi
-
-    local final_device_count
-    final_device_count=$(echo "$DEVICES" | jq 'length')
-
-    if [[ "$final_device_count" -eq 0 ]]; then
-        echo ""
-        echo "========================================="
-        echo "No devices were successfully retrieved"
-        echo "========================================="
-        return
-    fi
-
-    echo ""
-    echo "========================================="
-    echo "Successfully retrieved $final_device_count of $device_count devices"
-    echo "========================================="
-
-    # ---- Output files ----
-    local timestamp
-    timestamp=$(date +%Y%m%d_%H%M%S)
-
-    local json_file="${output_dir}/devices_${timestamp}.json"
-    local csv_file="${output_dir}/devices_${timestamp}.csv"
-
-    echo ""
-    echo "$DEVICES" | jq '.' > "$json_file"
-    echo "Devices saved to: $json_file"
-
-    # ---- CSV export ----
-    echo "ID,Serial Number,Model,Product Family,Product Type,Status,Color,Capacity,Added to Org,Assigned MDM Server" > "$csv_file"
-    echo "$DEVICES" | jq -r '.[] | [
-        .id // "",
-        .attributes.serialNumber // "",
-        .attributes.deviceModel // "",
-        .attributes.productFamily // "",
-        .attributes.productType // "",
-        .attributes.status // "",
-        .attributes.color // "",
-        .attributes.deviceCapacity // "",
-        .attributes.addedToOrgDateTime // "",
-        .assignedMdmServerName // "Unassigned"
-    ] | @csv' >> "$csv_file"
-
-    echo "CSV export saved to: $csv_file"
+show_device_details() {
+    local DEVICES="$1"
 
     # ---- Summary ----
     echo ""
@@ -776,7 +739,7 @@ export_devices_with_filter() {
     echo "Export Summary"
     echo "========================================="
     echo "Total devices exported: $final_device_count"
-
+    
     # Only show groupings if we have devices
     if [[ "$final_device_count" -gt 0 ]]; then
         echo ""
@@ -805,26 +768,377 @@ export_devices_with_filter() {
     fi
 
     echo ""
-    echo -n "View detailed device list? (y/n): "
-    read view_details
+    echo "========================================="
+    echo "Device Details"
+    echo "========================================="
 
-    if [[ "$view_details" =~ ^[Yy]$ ]]; then
-        echo ""
-        echo "========================================="
-        echo "Device Details"
-        echo "========================================="
-
-        echo "$DEVICES" | jq -c '.[]' | while read -r device; do
+ echo "$DEVICES" | jq -c '.[]' | while read -r device; do
             echo ""
             echo "Serial: $(echo "$device" | jq -r '.attributes.serialNumber')"
-            echo "  Model:        $(echo "$device" | jq -r '.attributes.deviceModel')"
-            echo "  Family:       $(echo "$device" | jq -r '.attributes.productFamily')"
-            echo "  Status:       $(echo "$device" | jq -r '.attributes.status')"
-            echo "  Color:        $(echo "$device" | jq -r '.attributes.color // "N/A"')"
-            echo "  Capacity:     $(echo "$device" | jq -r '.attributes.deviceCapacity // "N/A"')"
-            echo "  Added to Org: $(echo "$device" | jq -r '.attributes.addedToOrgDateTime')"
+            echo "  Model:            $(echo "$device" | jq -r '.attributes.deviceModel')"
+            echo "  Family:           $(echo "$device" | jq -r '.attributes.productFamily')"
+            echo "  Status:           $(echo "$device" | jq -r '.attributes.status')"
+            echo "  Color:            $(echo "$device" | jq -r '.attributes.color // "N/A"')"
+            echo "  Capacity:         $(echo "$device" | jq -r '.attributes.deviceCapacity // "N/A"')"
+            echo "  Added to Org:     $(echo "$device" | jq -r '.attributes.addedToOrgDateTime')"
+            echo "  Assigned MDM:     $(echo "$device" | jq -r '.assignedMdmServerName // "Unassigned"')"
+            echo "  Wifi MAC:         $(echo "$device" | jq -r '.attributes.wifiMacAddress // "N/A"')"
+            echo "  Org Release Date:  $(echo "$device" | jq -r '.attributes.releasedFromOrgDateTime // "N/A"')"
+            # Show AppleCare coverage if available
+            if echo "$device" | jq -e '.appleCareCoverage' >/dev/null 2>&1; then
+                local coverage_count=$(echo "$device" | jq '.appleCareCoverage | length')
+                if [[ "$coverage_count" -gt 0 ]]; then
+                    echo "  AppleCare:"
+                    echo "$device" | jq -c '.appleCareCoverage[]' | while read -r coverage; do
+                        echo "    - $(echo "$coverage" | jq -r '.attributes.description')"
+                        echo "      Status:   $(echo "$coverage" | jq -r '.attributes.status')"
+                        echo "      Start:    $(echo "$coverage" | jq -r '.attributes.startDateTime')"
+                        echo "      End:      $(echo "$coverage" | jq -r '.attributes.endDateTime // "No end date"')"
+                        echo "      Payment:  $(echo "$coverage" | jq -r '.attributes.paymentType')"
+                    done
+                else
+                    echo "  AppleCare:        No coverage"
+                fi
+            fi
         done
+}
+
+# Export devices with MDM filtering
+export_devices_with_filter() {
+    local access_token="$1"
+    local mdm_servers="$2"
+    local output_dir="$3"
+    
+    log_info "Starting device export process"
+    
+    echo ""
+    echo "MDM Server Selection"
+    echo "===================="
+    
+    # ---- Get selection (ONLY call once) ----
+    local filter_result
+    filter_result=$(select_mdm_servers_interactive "$mdm_servers")
+    
+    # ---- Handle cancel / errors ----
+    if [[ "$filter_result" == "CANCEL" ]]; then
+        log_info "Export canceled by user"
+        echo "Export canceled by user."
+        return
     fi
+    
+    if [[ "$filter_result" == ERROR:* ]]; then
+        log_error "Selection error: ${filter_result#ERROR:}"
+        echo "Selection error: ${filter_result#ERROR:}"
+        return
+    fi
+    
+    # ---- Parse selected server IDs ----
+    local selected_server_ids=()
+    if [[ "$filter_result" =~ ^SELECTED: ]]; then
+        local server_ids="${filter_result#SELECTED:}"
+        IFS=' ' read -rA selected_server_ids <<< "$server_ids"
+    else
+        log_error "Unexpected selection result: $filter_result"
+        echo "Unexpected selection result: [$filter_result]"
+        return
+    fi
+    
+    if [[ "${#selected_server_ids[@]}" -eq 0 ]]; then
+        log_warn "No valid MDM servers selected"
+        echo "No valid MDM servers selected. Nothing to export."
+        return
+    fi
+    
+    echo ""
+    echo "Selected MDM server(s):"
+    for id in "${selected_server_ids[@]}"; do
+        local name
+        name=$(echo "$mdm_servers" | jq -r --arg id "$id" '.data[] | select(.id == $id) | .attributes.serverName')
+        echo "  - $id ($name)"
+        log_debug "Selected MDM server: $id ($name)"
+    done
+    
+    # ---- Fetch device IDs from selected MDM servers ----
+    echo ""
+    log_info "Fetching device IDs from ${#selected_server_ids[@]} MDM server(s)"
+    
+    local device_ids
+    device_ids=$(get_devices_for_mdm_servers "$access_token" "${selected_server_ids[@]}")
+    
+    local device_count
+    device_count=$(echo "$device_ids" | jq 'length')
+    
+    if [[ "$device_count" -eq 0 ]]; then
+        log_warn "No devices found in selected MDM server(s)"
+        echo "No devices found in the selected MDM server(s)."
+        return
+    fi
+    
+    log_info "Found $device_count unique device(s)"
+    echo ""
+    echo "Found $device_count unique device(s). Fetching details..."
+    log_info "Fetching full device details for $device_count devices"
+    
+    # Ask if user wants AppleCare coverage
+    echo ""
+    echo -n "Fetch AppleCare coverage for each device? (y/n): "
+    read fetch_applecare_input
+    local fetch_applecare="false"
+    if [[ "$fetch_applecare_input" =~ ^[Yy]$ ]]; then
+        fetch_applecare="true"
+        log_info "AppleCare coverage will be fetched for each device"
+        log_info "Note: This will take longer as it makes an additional API call per device."
+    fi
+
+    # ---- Fetch full device records ----
+    local DEVICES
+    DEVICES=$(get_device_details_from_ids "$access_token" "$device_ids" "$mdm_servers" "$fetch_applecare")
+
+    log_debug "Returned data length: ${#DEVICES} characters"
+
+    # Strip any progress messages that may have leaked into output
+    # Remove lines that start with whitespace followed by [
+    DEVICES=$(echo "$DEVICES" | sed '/^[[:space:]]*\[.*Processing\.\.\./d')
+
+    # Debug: Save cleaned output to file for inspection
+    local debug_file="${output_dir}/debug_output_$(date +%Y%m%d_%H%M%S).txt"
+    printf '%s' "$DEVICES" > "$debug_file"
+    log_debug "Cleaned output saved to: $debug_file"
+
+    # Validate that DEVICES is valid JSON array
+    if ! echo "$DEVICES" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        log_error "Device fetch returned invalid JSON data"
+        echo ""
+        echo "========================================="
+        echo "Error: Device fetch returned invalid data"
+        echo "========================================="
+        echo ""
+        echo "First 200 characters of output:"
+        echo "${DEVICES:0:200}"
+        echo ""
+        echo "This could be due to:"
+        echo "  - Shell debug output contaminating JSON"
+        echo "  - Rate limiting from Apple's API"
+        echo "  - Network connectivity issues"
+        echo ""
+        echo "Debug file saved to: $debug_file"
+        echo "Check the log file for details: ${SCRIPT_LOG}"
+        return
+    fi
+    
+    local final_device_count
+    final_device_count=$(echo "$DEVICES" | jq 'length')
+    
+    if [[ "$final_device_count" -eq 0 ]]; then
+        log_warn "No devices were successfully retrieved"
+        echo ""
+        echo "========================================="
+        echo "No devices were successfully retrieved"
+        echo "========================================="
+        return
+    fi
+    
+    log_success "Retrieved $final_device_count of $device_count devices"
+    
+    echo ""
+    echo "========================================="
+    echo "Successfully retrieved $final_device_count of $device_count devices"
+    echo "========================================="
+    
+    # ---- Output selection ----
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+
+    local json_file="${output_dir}/devices_${timestamp}.json"
+    local csv_file="${output_dir}/devices_${timestamp}.csv"
+
+    echo ""
+    echo "Output Options"
+    echo "=============="
+    echo "1. Save JSON only"
+    echo "2. Save CSV only"
+    echo "3. Save BOTH JSON and CSV"
+    echo "4. Show device details only (no files)"
+    echo "5. Save JSON, CSV, and show details"
+    echo "6. Return to main menu"
+    echo ""
+    echo -n "Choose an option (1-6): "
+    read output_choice
+
+    case "$output_choice" in
+        1)
+            log_info "Saving JSON to: $json_file"
+            echo "$DEVICES" | jq '.' > "$json_file"
+            echo "JSON saved to: $json_file"
+            show_main_menu
+            ;;
+        2)
+            export_csv_devices "$DEVICES" "$csv_file" "$fetch_applecare"
+            show_main_menu
+            ;;
+        3)
+            log_info "Saving JSON to: $json_file"
+            echo "$DEVICES" | jq '.' > "$json_file"
+            export_csv_devices "$DEVICES" "$csv_file" "$fetch_applecare"
+            show_main_menu
+            ;;
+        4)
+            show_device_details "$DEVICES"
+            show_main_menu
+            ;;
+        5)
+            log_info "Saving JSON to: $json_file"
+            echo "$DEVICES" | jq '.' > "$json_file"
+            export_csv_devices "$DEVICES" "$csv_file" "$fetch_applecare"
+            show_device_details "$DEVICES"
+            show_main_menu
+            ;;
+        6)
+            echo "Returning to main menu."
+            log_info "Returning to main menu."
+            show_main_menu
+            ;;
+        *)
+            echo "Invalid selection. Returning to main menu."
+            log_warn "Invalid selection. Returning to main menu."
+            show_main_menu
+            return
+            ;;
+    esac
+
+    # # ---- JSON export ----
+    # log_info "Saving devices to: $json_file"
+    # echo ""
+    # echo "$DEVICES" | jq '.' > "$json_file"
+    # echo "Devices saved to: $json_file"
+    
+    # # ---- CSV export ----
+    # log_info "Creating CSV export: $csv_file"
+    
+    # if [[ "$fetch_applecare" == "true" ]]; then
+    #     # CSV with AppleCare info - ONE ROW PER DEVICE
+    #     echo "ID,Serial Number,Model,Product Family,Product Type,Status,Color,Capacity,Added to Org,Assigned MDM Server,WiFi MAC,Org Release Date,AppleCare Descriptions,AppleCare Statuses,AppleCare Start Dates,AppleCare End Dates,AppleCare Payment Types" > "$csv_file"
+        
+    # echo "$DEVICES" | jq -r '.[] |
+    #     .appleCareCoverage // [] as $coverage |
+    #     [
+    #         .id // "",
+    #         .attributes.serialNumber // "",
+    #         .attributes.deviceModel // "",
+    #         .attributes.productFamily // "",
+    #         .attributes.productType // "",
+    #         .attributes.status // "",
+    #         .attributes.color // "",
+    #         .attributes.deviceCapacity // "",
+    #         .attributes.addedToOrgDateTime // "",
+    #         .assignedMdmServerName // "Unassigned",
+    #         .attributes.wifiMacAddress // "",
+    #         .attributes.releasedFromOrgDateTime // "",
+
+    #         ($coverage | map(.attributes.description) | join(" | ")) // "",
+    #         ($coverage | map(.attributes.status) | join(" | ")) // "",
+    #         ($coverage | map(.attributes.startDateTime) | join(" | ")) // "",
+    #         ($coverage | map(.attributes.endDateTime // "No end date") | join(" | ")) // "",
+    #         ($coverage | map(.attributes.paymentType) | join(" | ")) // ""
+    #     ] | @csv' >> "$csv_file"
+    # else
+    #     # CSV without AppleCare info (original)
+    #     echo "ID,Serial Number,Model,Product Family,Product Type,Status,Color,Capacity,Added to Org,Assigned MDM Server,WiFi MAC,Org Release Date" > "$csv_file"
+        
+    #     echo "$DEVICES" | jq -r '.[] | [
+    #         .id // "",
+    #         .attributes.serialNumber // "",
+    #         .attributes.deviceModel // "",
+    #         .attributes.productFamily // "",
+    #         .attributes.productType // "",
+    #         .attributes.status // "",
+    #         .attributes.color // "",
+    #         .attributes.deviceCapacity // "",
+    #         .attributes.addedToOrgDateTime // "",
+    #         .assignedMdmServerName // "Unassigned"
+    #         .attributes.wifiMacAddress // "",
+    #         .attributes.releasedFromOrgDateTime // ""
+    #     ] | @csv' >> "$csv_file"
+    # fi
+    
+    # echo "CSV export saved to: $csv_file"
+    
+    # log_success "Export completed: $final_device_count devices saved"
+    
+    # # ---- Summary ----
+    # echo ""
+    # echo "========================================="
+    # echo "Export Summary"
+    # echo "========================================="
+    # echo "Total devices exported: $final_device_count"
+    
+    # # Only show groupings if we have devices
+    # if [[ "$final_device_count" -gt 0 ]]; then
+    #     echo ""
+    #     echo "Devices by Model:"
+    #     if echo "$DEVICES" | jq -e '.[0].attributes.deviceModel' >/dev/null 2>&1; then
+    #         echo "$DEVICES" | jq -r 'group_by(.attributes.deviceModel) | .[] | "\(.[0].attributes.deviceModel): \(length)"' | sort -t: -k2 -rn | column -t -s:
+    #     else
+    #         echo "  (Model information not available)"
+    #     fi
+        
+    #     echo ""
+    #     echo "Devices by Status:"
+    #     if echo "$DEVICES" | jq -e '.[0].attributes.status' >/dev/null 2>&1; then
+    #         echo "$DEVICES" | jq -r 'group_by(.attributes.status) | .[] | "\(.[0].attributes.status): \(length)"' | sort -t: -k2 -rn | column -t -s:
+    #     else
+    #         echo "  (Status information not available)"
+    #     fi
+        
+    #     echo ""
+    #     echo "Devices by Product Family:"
+    #     if echo "$DEVICES" | jq -e '.[0].attributes.productFamily' >/dev/null 2>&1; then
+    #         echo "$DEVICES" | jq -r 'group_by(.attributes.productFamily) | .[] | "\(.[0].attributes.productFamily): \(length)"' | sort -t: -k2 -rn | column -t -s:
+    #     else
+    #         echo "  (Product family information not available)"
+    #     fi
+    # fi
+    
+    # echo ""
+    # echo -n "View detailed device list? (y/n): "
+    # read view_details
+    
+    # if [[ "$view_details" =~ ^[Yy]$ ]]; then
+    #     echo ""
+    #     echo "========================================="
+    #     echo "Device Details"
+    #     echo "========================================="
+        
+    #     echo "$DEVICES" | jq -c '.[]' | while read -r device; do
+    #         echo ""
+    #         echo "Serial: $(echo "$device" | jq -r '.attributes.serialNumber')"
+    #         echo "  Model:            $(echo "$device" | jq -r '.attributes.deviceModel')"
+    #         echo "  Family:           $(echo "$device" | jq -r '.attributes.productFamily')"
+    #         echo "  Status:           $(echo "$device" | jq -r '.attributes.status')"
+    #         echo "  Color:            $(echo "$device" | jq -r '.attributes.color // "N/A"')"
+    #         echo "  Capacity:         $(echo "$device" | jq -r '.attributes.deviceCapacity // "N/A"')"
+    #         echo "  Added to Org:     $(echo "$device" | jq -r '.attributes.addedToOrgDateTime')"
+    #         echo "  Assigned MDM:     $(echo "$device" | jq -r '.assignedMdmServerName // "Unassigned"')"
+    #         echo "  Wifi MAC:         $(echo "$device" | jq -r '.attributes.wifiMacAddress // "N/A"')"
+    #         echo "  Org Release Date:  $(echo "$device" | jq -r '.attributes.releasedFromOrgDateTime // "N/A"')"
+    #         # Show AppleCare coverage if available
+    #         if echo "$device" | jq -e '.appleCareCoverage' >/dev/null 2>&1; then
+    #             local coverage_count=$(echo "$device" | jq '.appleCareCoverage | length')
+    #             if [[ "$coverage_count" -gt 0 ]]; then
+    #                 echo "  AppleCare:"
+    #                 echo "$device" | jq -c '.appleCareCoverage[]' | while read -r coverage; do
+    #                     echo "    - $(echo "$coverage" | jq -r '.attributes.description')"
+    #                     echo "      Status:   $(echo "$coverage" | jq -r '.attributes.status')"
+    #                     echo "      Start:    $(echo "$coverage" | jq -r '.attributes.startDateTime')"
+    #                     echo "      End:      $(echo "$coverage" | jq -r '.attributes.endDateTime // "No end date"')"
+    #                     echo "      Payment:  $(echo "$coverage" | jq -r '.attributes.paymentType')"
+    #                 done
+    #             else
+    #                 echo "  AppleCare:        No coverage"
+    #             fi
+    #         fi
+    #     done
+    # fi
 }
 
   
@@ -1284,47 +1598,15 @@ select_mdm_servers_interactive() {
     echo "SELECTED:${selected[*]}"
 }
   
-# ============================================================================
-# MAIN SCRIPT
-# ============================================================================
-  
-main() {
-    echo "Apple School Manager API - Device Management Tool"
-    echo "================================================="
+show_main_menu() {
     echo ""
-    
-    # Check dependencies
-    check_dependencies
-    
-    # Allow command line arguments to override
-    if [[ -n "$1" ]]; then
-        CLIENT_ASSERTION="$1"
-    fi
-    if [[ -n "$2" ]]; then
-        CLIENT_ID="$2"
-    fi
-    if [[ -n "$3" ]]; then
-        OUTPUT_DIR="$3"
-    fi
-    
-    # Configure Apple Manager settings
-    configure_apple_manager
-    
-    # Prompt for any missing variables
-    prompt_for_variables
-    
-    # Get access token (DON'T create output directory here)
-    ACCESS_TOKEN=$(get_access_token "$CLIENT_ASSERTION" "$CLIENT_ID" "$SCOPE")
-    
-    if [[ -z "$ACCESS_TOKEN" ]]; then
-        echo "Error: Failed to get access token"
-        exit 1
-    fi
-    
     echo ""
-    
+
     # Show main menu
-    echo "Main Menu:"
+    echo "=================================="
+    echo "             Main Menu"
+    echo "=================================="
+    echo ""
     echo "  1. Export devices from MDM server(s)"
     echo "  2. Manage MDM device assignments"
     echo "  3. Check activity status"
@@ -1402,6 +1684,48 @@ main() {
     
     echo ""
     echo "Done!"
+}
+# ============================================================================
+# MAIN SCRIPT
+# ============================================================================
+  
+main() {
+    echo "Apple School Manager API - Device Management Tool"
+    echo "================================================="
+    echo ""
+    
+    # Check dependencies
+    check_dependencies
+    
+    # Allow command line arguments to override
+    if [[ -n "$1" ]]; then
+        CLIENT_ASSERTION="$1"
+    fi
+    if [[ -n "$2" ]]; then
+        CLIENT_ID="$2"
+    fi
+    if [[ -n "$3" ]]; then
+        OUTPUT_DIR="$3"
+    fi
+    
+    # Configure Apple Manager settings
+    configure_apple_manager
+    
+    # Prompt for any missing variables
+    prompt_for_variables
+    
+    # Get access token (DON'T create output directory here)
+    ACCESS_TOKEN=$(get_access_token "$CLIENT_ASSERTION" "$CLIENT_ID" "$SCOPE")
+    
+    if [[ -z "$ACCESS_TOKEN" ]]; then
+        echo "Error: Failed to get access token"
+        exit 1
+    fi
+    
+    echo ""
+    
+    # Show main menu
+    show_main_menu
 }
   
 # Run main function
